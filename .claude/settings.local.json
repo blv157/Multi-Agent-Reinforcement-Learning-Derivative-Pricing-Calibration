@@ -5,7 +5,10 @@
       "Bash(python -c ':*)",
       "Bash(python src/american_mc.py)",
       "Bash(python src/reward.py)",
-      "Bash(python src/policy.py)"
+      "Bash(python src/policy.py)",
+      "Bash(du -h data/UnderlyingOptionsEODCalcs_*.csv)",
+      "Bash(du -h results/exp1/*.pt)",
+      "Bash(wc -l data/UnderlyingOptionsEODCalcs_*.csv)"
     ]
   }
 }
