@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(python -c ':*)",
+      "Bash(python src/american_mc.py)",
+      "Bash(python src/reward.py)",
+      "Bash(python src/policy.py)"
+    ]
+  }
+}
