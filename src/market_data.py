@@ -268,6 +268,41 @@ class VolSurface:
 
         return pd.DataFrame(rows)
 
+    def otm_denom_tensor(
+        self,
+        grid:   "pd.DataFrame",
+        device: str = "cpu",
+    ) -> "torch.Tensor":
+        """
+        Compute the OTM-adjusted denominator tensor for the calibration loss.
+
+        For each instrument in ``grid``:
+          - K >= S0  (OTM call):  denom = call_price_mkt           (unchanged)
+          - K <  S0  (ITM call):  denom = call_price_mkt - (S0-K)  (OTM put price)
+
+        The put price equals the call price minus intrinsic value by put-call
+        parity at zero interest rate.  Using the OTM put as the denominator on
+        the left wing gives the same gradient weight as an OTM call of the same
+        time-value — fixing the ~2000x gradient imbalance between the left and
+        right sides of the smile.
+
+        Parameters
+        ----------
+        grid   : DataFrame from build_instrument_grid()
+        device : torch device string
+
+        Returns
+        -------
+        denom : (M,) tensor of OTM prices to use as the loss denominator
+        """
+        import torch
+        S0        = self.spot
+        strikes   = torch.tensor(grid["K"].values,         dtype=torch.float32)
+        mkt_call  = torch.tensor(grid["price_mkt"].values, dtype=torch.float32)
+        intrinsic = torch.clamp(torch.tensor(S0, dtype=torch.float32) - strikes, min=0.0)
+        denom     = (mkt_call - intrinsic).clamp(min=1e-4)
+        return denom.to(device)
+
     # ── Convenience ─────────────────────────────────────────────────────────
 
     def summary(self):

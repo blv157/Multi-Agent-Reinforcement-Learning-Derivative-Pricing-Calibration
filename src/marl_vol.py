@@ -98,7 +98,8 @@ from diffusion      import MCEngine, simulate_paths, DELTA, generate_brownian
 from market_data    import VolSurface
 from options        import mc_call_prices, make_bermudan, BermudanSpec
 from american_mc    import bermudan_price
-from reward         import (calibration_loss, reference_loss_bs,
+from reward         import (calibration_loss, calibration_loss_iv,
+                             reference_loss_bs,
                              compute_rewards, compute_rewards_bermudan)
 from policy         import (PolicyNet, ValueNet,
                              build_state_exp1,
@@ -209,12 +210,14 @@ class TrainConfig:
     save_dir:     str   = "results"
 
     # --- Convergence ---
-    # Training stops when the improvement in rolling-average reward between
-    # two consecutive windows of size conv_window is smaller than conv_tol.
-    # This matches the paper's intent of running "until convergence" rather
-    # than a fixed episode count.  Set conv_window=0 to disable.
-    conv_window:  int   = 50      # rolling window size for convergence check
-    conv_tol:     float = 1e-3    # minimum improvement to continue training
+    # Patience-based early stopping: track the best rolling-window mean reward
+    # seen so far.  Each episode we check whether the latest window mean beats
+    # the best by more than conv_tol.  If not, increment a patience counter.
+    # Stop when the counter reaches conv_patience windows.
+    # Set conv_window=0 to disable entirely and run all n_episodes.
+    conv_window:   int   = 100     # rolling window size for convergence check
+    conv_tol:      float = 1e-3    # minimum improvement over best window mean
+    conv_patience: int   = 5       # stop after this many non-improving windows
 
     # --- Device ---
     device:     str   = "cpu"     # 'cpu' or 'cuda'
@@ -268,15 +271,19 @@ class RolloutBuffer:
 
 @torch.no_grad()
 def collect_rollout(
-    engine:   MCEngine,
-    policy:   PolicyNet,
-    value:    ValueNet,
-    manager:  BasisPlayerManager,
-    surface:  VolSurface,
-    grid:     pd.DataFrame,
-    cfg:      TrainConfig,
-    bermudan: Optional[BermudanSpec] = None,
-    l_ref:    Optional[torch.Tensor] = None,
+    engine:        MCEngine,
+    policy:        PolicyNet,
+    value:         ValueNet,
+    manager:       BasisPlayerManager,
+    surface:       VolSurface,
+    grid:          pd.DataFrame,
+    cfg:           TrainConfig,
+    bermudan:      Optional[BermudanSpec] = None,
+    l_ref:         Optional[torch.Tensor] = None,
+    mkt_otm:       Optional[torch.Tensor] = None,
+    inst_strikes:  Optional[torch.Tensor] = None,
+    inst_T_years:  Optional[torch.Tensor] = None,
+    inst_mkt_ivs:  Optional[torch.Tensor] = None,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor,
     torch.Tensor, float, float
@@ -378,8 +385,14 @@ def collect_rollout(
                              dtype=torch.float32, device=device)
 
     if cfg.experiment == "exp1":
-        mc_px    = mc_call_prices(S_full, grid, delta=cfg.delta)
-        loss_val = calibration_loss(mc_px, mkt_px).item()
+        mc_px = mc_call_prices(S_full, grid, delta=cfg.delta)
+
+        # OTM-adjusted relative price loss.
+        # For K < S0 the denominator is the OTM put price (= call - intrinsic)
+        # rather than the ITM call price, giving equal gradient weight across
+        # both wings of the smile.  The IV tensors are retained for diagnostic
+        # use (smile plots) but are not used in the training loss.
+        loss_val = calibration_loss(mc_px, mkt_px, denom=mkt_otm).item()
 
         # ── Reward: r = L_ref - L  (paper eq. 8) ────────────────────────────────
         # Positive when the policy beats the flat BS baseline, negative when worse.
@@ -536,7 +549,15 @@ def ppo_update(
 
         # ── Importance sampling ratio ────────────────────────────────────────
         # rho = pi_new(a|s) / pi_old(a|s) = exp(log_pi_new - log_pi_old)
-        log_ratio = log_probs_new - log_probs_old.detach()
+        #
+        # Clamp the log-ratio before exponentiating.  If the policy drifts far
+        # from the rollout distribution the raw difference can be ±100, causing
+        # exp() to overflow float32 (~3.4e38 max) and produce Inf/NaN that
+        # cascades into an astronomically large policy loss (seen at ep 610:
+        # pl = 3.2e11).  Clamping to ±10 limits ratio to [~5e-5, ~22000]
+        # which is already well beyond any meaningful importance-weight range
+        # (the PPO clip at 0.3 confines useful updates to ratio ∈ [0.7, 1.3]).
+        log_ratio = (log_probs_new - log_probs_old.detach()).clamp(-10.0, 10.0)
         ratio     = log_ratio.exp()                              # (mb,)
 
         # ── Approximate KL divergence (for early stopping) ──────────────────
@@ -628,8 +649,24 @@ class MARLVolTrainer:
             self.grid["price_mkt"].values, dtype=torch.float32, device=device
         )
 
-        # ── Reference loss (flat BS smile) ──────────────────────────────────
-        self.l_ref = reference_loss_bs(self.grid, surface, device=device)
+        # ── Instrument tensors for IV-based calibration loss ────────────────
+        # IV-space loss weights every strike identically — no gradient
+        # imbalance between cheap OTM calls and expensive ITM calls.
+        # We precompute strikes, maturities, and market IVs once here.
+        self.inst_strikes = torch.tensor(
+            self.grid["K"].values, dtype=torch.float32, device=device)
+        self.inst_T_years = torch.tensor(
+            self.grid["T_years"].values, dtype=torch.float32, device=device)
+        self.inst_mkt_ivs = torch.tensor(
+            self.grid["iv_mkt"].values, dtype=torch.float32, device=device)
+
+        # OTM-adjusted price denominator — kept as fallback for IV loss when
+        # Newton-Raphson fails to converge (rare but possible for deep OTM MC prices).
+        self.mkt_otm = surface.otm_denom_tensor(self.grid, device=device)
+
+        # ── Reference loss (flat BS smile) — in IV space ─────────────────────
+        self.l_ref = reference_loss_bs(self.grid, surface, device=device,
+                                       denom=self.mkt_otm)
         print(f"Reference loss (BS flat smile): {self.l_ref.item():.6f}")
 
         # ── Policy and value networks ────────────────────────────────────────
@@ -638,10 +675,9 @@ class MARLVolTrainer:
 
         # ── Optimisers ──────────────────────────────────────────────────────
         # Both networks use the same learning rate (paper Table 1: lr=1e-4).
-        # A higher value lr causes the value function to over-adapt: once the
-        # policy finds a good solution, V quickly locks onto the high reward,
-        # then on the next episode the advantage = G - V is strongly negative
-        # even for good actions, pushing the policy away from the optimum.
+        # The value function needs to track returns at the same pace as the
+        # policy changes them — a slower value LR makes advantages noisier,
+        # which hurts the policy gradient, especially with small reward scales.
         self.opt_p = torch.optim.Adam(self.policy.parameters(), lr=cfg.lr)
         self.opt_v = torch.optim.Adam(self.value.parameters(),  lr=cfg.lr)
 
@@ -696,6 +732,13 @@ class MARLVolTrainer:
 
         t_start = time.perf_counter()
 
+        # ── Best-checkpoint tracking ─────────────────────────────────────────
+        best_reward      = -float("inf")   # best single-episode reward seen
+        best_episode     = 0
+        # Patience counter for convergence check
+        best_window_mean = -float("inf")   # best rolling-window mean seen
+        no_improve_count = 0               # consecutive non-improving windows
+
         for episode in range(1, cfg.n_episodes + 1):
             t_ep = time.perf_counter()
 
@@ -712,15 +755,19 @@ class MARLVolTrainer:
                 # Single rollout
                 (states_bp, sigmas_bp, log_probs_bp,
                  rewards, loss_val, ep_r) = collect_rollout(
-                    engine   = self.engine,
-                    policy   = self.policy,
-                    value    = self.value,
-                    manager  = self.manager,
-                    surface  = self.surface,
-                    grid     = self.grid,
-                    cfg      = cfg,
-                    bermudan = self.bermudan,
-                    l_ref    = self.l_ref,
+                    engine        = self.engine,
+                    policy        = self.policy,
+                    value         = self.value,
+                    manager       = self.manager,
+                    surface       = self.surface,
+                    grid          = self.grid,
+                    cfg           = cfg,
+                    bermudan      = self.bermudan,
+                    l_ref         = self.l_ref,
+                    mkt_otm       = self.mkt_otm,
+                    inst_strikes  = self.inst_strikes,
+                    inst_T_years  = self.inst_T_years,
+                    inst_mkt_ivs  = self.inst_mkt_ivs,
                 )
 
                 # Track return statistics (for logging/diagnostics only)
@@ -811,29 +858,65 @@ class MARLVolTrainer:
             if episode % cfg.save_every == 0:
                 self._save_checkpoint(episode)
 
-            # ── Convergence check ────────────────────────────────────────────
-            # Compare the mean reward over the most recent window against the
-            # previous window.  Stop when improvement falls below conv_tol.
+            # ── Best-checkpoint tracking ──────────────────────────────────────
+            # Save a dedicated 'best' checkpoint whenever a new single-episode
+            # reward record is set.  This guarantees plots always use the model
+            # with the lowest calibration loss seen during the entire run,
+            # regardless of where training is stopped.
+            if avg_reward > best_reward:
+                best_reward  = avg_reward
+                best_episode = episode
+                self._save_checkpoint(episode, tag="best")
+
+            # ── Convergence check (patience-based, non-overlapping windows) ──
+            # Evaluate one NON-OVERLAPPING window every conv_window episodes.
+            # This ensures the patience counter represents truly independent
+            # windows, not episode-by-episode sliding-mean noise.
+            #
+            # At episode w, 2w, 3w, ... we compute the mean reward of the
+            # just-completed window of w episodes.  If this mean does not beat
+            # the best window mean by more than conv_tol we increment the
+            # patience counter.  Training stops after conv_patience consecutive
+            # non-improving windows (i.e., conv_patience * conv_window episodes
+            # of genuine no-progress).
             w = cfg.conv_window
-            if w > 0 and episode >= 2 * w:
-                rewards_recent = [r["reward"] for r in self.log[-w:]]
-                rewards_prev   = [r["reward"] for r in self.log[-2*w:-w]]
-                improvement = np.mean(rewards_recent) - np.mean(rewards_prev)
-                if improvement < cfg.conv_tol:
-                    print(f"\nConverged at episode {episode} "
-                          f"(reward improvement {improvement:.5f} < {cfg.conv_tol})")
-                    break
+            if w > 0 and episode >= w and episode % w == 0:
+                # Mean of the most-recently completed w-episode window
+                window_mean = np.mean([r["reward"] for r in self.log[-w:]])
+                if window_mean > best_window_mean + cfg.conv_tol:
+                    best_window_mean = window_mean
+                    no_improve_count = 0
+                else:
+                    no_improve_count += 1
+                    if no_improve_count >= cfg.conv_patience:
+                        print(f"\nConverged at episode {episode} "
+                              f"(no improvement > {cfg.conv_tol} for "
+                              f"{cfg.conv_patience} consecutive {w}-ep windows; "
+                              f"best was ep {best_episode}, reward={best_reward:.5f})")
+                        break
 
         # Final checkpoint
         self._save_checkpoint(episode)
+        print(f"  Best checkpoint: ep {best_episode}  reward={best_reward:.5f}")
         print(f"\nTraining complete. Total time: "
               f"{time.perf_counter() - t_start:.1f}s")
         return self.log
 
-    def _save_checkpoint(self, episode: int):
-        """Save policy, value, normalizer state, and log to disk."""
-        path = os.path.join(self.cfg.save_dir,
-                            f"{self.cfg.experiment}_ep{episode}.pt")
+    def _save_checkpoint(self, episode: int, tag: str = ""):
+        """Save policy, value, normalizer state, and log to disk.
+
+        Parameters
+        ----------
+        episode : episode number (used in the default filename)
+        tag     : optional suffix override; if given, the file is saved as
+                  ``{experiment}_{tag}.pt`` instead of ``{experiment}_ep{N}.pt``.
+                  Use tag='best' to maintain a single always-current best file.
+        """
+        if tag:
+            fname = f"{self.cfg.experiment}_{tag}.pt"
+        else:
+            fname = f"{self.cfg.experiment}_ep{episode}.pt"
+        path = os.path.join(self.cfg.save_dir, fname)
         torch.save({
             "episode":        episode,
             "policy":         self.policy.state_dict(),

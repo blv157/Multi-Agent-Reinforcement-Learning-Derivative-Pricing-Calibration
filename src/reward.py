@@ -193,28 +193,115 @@ def _norm_pdf(x: torch.Tensor) -> torch.Tensor:
 def calibration_loss(
     mc_prices:  torch.Tensor,
     mkt_prices: torch.Tensor,
+    denom:      Optional[torch.Tensor] = None,
     eps:        float = 1e-4,
 ) -> torch.Tensor:
     """
-    Normalised mean squared pricing error (eq. 6).
+    Normalised mean squared pricing error (eq. 6), with OTM-adjusted denominator.
 
         L = (1/M) * sum_k [ (mc_prices[k] - mkt_prices[k])^2
-                             / max(mkt_prices[k], eps)^2 ]
+                             / max(denom[k], eps)^2 ]
+
+    When ``denom`` is None, defaults to ``mkt_prices`` (original eq. 6 behaviour).
+
+    OTM adjustment
+    --------------
+    The standard relative-price loss weights OTM calls (right wing, small price)
+    far more heavily than ITM calls (left wing, large price dominated by intrinsic
+    value).  The result is that the policy gradient is essentially blind to the
+    left side of the smile — the agent never learns the put skew.
+
+    The fix: use OTM *put* prices as the denominator for K < S0.  By put-call
+    parity (zero rate):  put = call - (S0 - K)+ ,  so the OTM put price is just
+    the ITM call price minus its intrinsic value — a small number that properly
+    reflects the option's time-value / volatility sensitivity.
+
+    The absolute error (mc - mkt) is *identical* for a call and its put partner;
+    only the denominator changes.  Concretely for K/S0 = 0.88:
+      - ITM call mkt price ≈ $353  →  denominator = 353²  (nearly blind)
+      - OTM put  mkt price ≈  $15  →  denominator =  15²  (2000× more signal)
+
+    Pre-compute the OTM denominator once per surface via
+    ``VolSurface.otm_denom_tensor(grid, S0, device)`` and pass it here.
 
     Parameters
     ----------
     mc_prices  : (M,) MC call prices under the current policy
     mkt_prices : (M,) market call prices from the instrument grid
+    denom      : (M,) denominator tensor (OTM prices); defaults to mkt_prices
     eps        : floor on the denominator to prevent division by near-zero
-                 (protects against deep OTM options with tiny market prices)
 
     Returns
     -------
     loss : scalar tensor — non-negative, dimensionless
     """
-    denom = mkt_prices.clamp(min=eps)
+    if denom is None:
+        denom = mkt_prices
+    denom = denom.clamp(min=eps)
     rel_err_sq = ((mc_prices - mkt_prices) / denom) ** 2
     return rel_err_sq.mean()
+
+
+# ---------------------------------------------------------------------------
+# IV-based calibration loss — equal weight per instrument in vol space
+# ---------------------------------------------------------------------------
+
+def calibration_loss_iv(
+    mc_prices:  torch.Tensor,
+    S0:         float,
+    strikes:    torch.Tensor,
+    T_years:    torch.Tensor,
+    mkt_ivs:    torch.Tensor,
+    fallback_denom: Optional[torch.Tensor] = None,
+    min_valid:  int   = 10,
+) -> torch.Tensor:
+    """
+    IV-space calibration loss — mean squared implied vol error.
+
+        L_IV = (1/M_valid) * sum_k [ (IV_mc(K_k, T_k) - IV_mkt(K_k, T_k))^2 ]
+
+    Why IV space instead of price space
+    ------------------------------------
+    In price space (eq. 6), the gradient weight of each instrument is
+    proportional to 1 / price².  Deep OTM calls ($0.13) have ~400x more
+    weight than slightly ITM puts ($2.60) even after the OTM denominator fix.
+    The smile plot visualises IV directly, so calibrating in IV space gives
+    each strike exactly the weight that corresponds to how it looks in the plot.
+
+    Robustness
+    ----------
+    IV inversion (Newton-Raphson) can fail for MC prices below the no-arbitrage
+    lower bound — this can happen for deep OTM strikes with large MC noise.
+    NaN results are masked out via ``valid = ~isnan(iv_mc)``.  If fewer than
+    ``min_valid`` instruments have valid IVs (unusual), we fall back to the
+    OTM-adjusted price loss to avoid a degenerate gradient.
+
+    Parameters
+    ----------
+    mc_prices      : (M,) MC call prices
+    S0             : spot price (scalar float)
+    strikes        : (M,) strike prices
+    T_years        : (M,) times to expiry in years
+    mkt_ivs        : (M,) market implied vols
+    fallback_denom : (M,) OTM denominator for the price-loss fallback
+    min_valid      : minimum valid instruments before falling back
+
+    Returns
+    -------
+    loss : scalar tensor
+    """
+    iv_mc = implied_vol_batch(mc_prices, S0, strikes, T_years)
+    valid = ~torch.isnan(iv_mc)
+
+    if int(valid.sum()) < min_valid:
+        # Too few valid IV estimates (rare) — fall back to OTM price loss
+        # using mkt_ivs as a proxy for the market price denominator
+        if fallback_denom is not None:
+            return calibration_loss(mc_prices, mc_prices, denom=fallback_denom)
+        # Ultimate fallback: uniform weight
+        return (mc_prices - mc_prices).pow(2).mean() + torch.tensor(1.0, device=mc_prices.device)
+
+    return ((iv_mc[valid] - mkt_ivs[valid]) ** 2).mean()
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +312,7 @@ def reference_loss_bs(
     instruments: pd.DataFrame,
     surface:     VolSurface,
     device:      str = "cpu",
+    denom:       Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Calibration loss of a flat Black-Scholes smile (the baseline).
@@ -255,9 +343,10 @@ def reference_loss_bs(
     sigma_atm = surface.get_iv(surface.spot, t_min)
 
     S         = surface.spot
-    strikes   = torch.tensor(instruments["K"].values,     dtype=torch.float32, device=device)
+    strikes   = torch.tensor(instruments["K"].values,      dtype=torch.float32, device=device)
     T_years   = torch.tensor(instruments["T_years"].values, dtype=torch.float32, device=device)
     mkt_px    = torch.tensor(instruments["price_mkt"].values, dtype=torch.float32, device=device)
+    mkt_ivs   = torch.tensor(instruments["iv_mkt"].values,  dtype=torch.float32, device=device)
 
     # Flat BS prices for all instruments
     flat_px = torch.tensor(
@@ -266,7 +355,7 @@ def reference_loss_bs(
         dtype=torch.float32, device=device,
     )
 
-    return calibration_loss(flat_px, mkt_px)
+    return calibration_loss(flat_px, mkt_px, denom=denom)
 
 
 # ---------------------------------------------------------------------------
