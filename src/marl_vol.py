@@ -463,16 +463,26 @@ def collect_rollout(
             fallback_denom=mkt_otm,
         ).item()
 
-        # Bermudan reward: normalise by European call reference (≈1 at start)
+        # Bermudan reward: normalise by European call reference (≈-1 at start,
+        # improves toward 0 as Bermudan price falls toward European level).
         b_ref_val = l_ref_berm if (l_ref_berm is not None and l_ref_berm > 0) else 1.0
         berm_r = -b_price / b_ref_val
 
-        # Calibration reward (same sign convention as exp1: higher = better)
+        # Calibration reward (same sign convention as exp1: higher = better).
+        # CLIPPED to [-2, 1]: without clipping the initial calibration penalty
+        # can reach -98 for a randomly-initialised policy (calib_loss >> L_ref).
+        # This creates reward variance of O(100) vs the Bermudan term's O(1),
+        # overwhelming the PPO gradient and causing catastrophic divergence
+        # (observed: Bermudan price 96→197 over 200 eps due to unconstrained spike).
+        # Clipping at -2 keeps the combined reward in [-3, 1], matching the
+        # scale of exp1 rewards and preventing gradient blow-up while still
+        # providing strong calibration signal when the policy is well-behaved.
         if l_ref is not None:
             l_ref_val = l_ref.item() if torch.is_tensor(l_ref) else l_ref
             calib_r   = (l_ref_val - calib_val) / l_ref_val if l_ref_val > 0 else 0.0
         else:
             calib_r = 0.0
+        calib_r = max(calib_r, -2.0)   # clip: prevents -100 spikes dominating gradients
 
         combined_r = berm_r + cfg.calib_weight * calib_r
         raw_r_t    = torch.tensor(combined_r, device=device)
