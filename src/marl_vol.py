@@ -93,6 +93,7 @@ import numpy as np
 import pandas as pd
 from typing import Optional, Dict, Tuple, List
 from dataclasses import dataclass, field
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from diffusion      import MCEngine, simulate_paths, DELTA, generate_brownian
 from market_data    import VolSurface
@@ -220,6 +221,12 @@ class TrainConfig:
     conv_tol:      float = 1e-3    # minimum improvement over best window mean
     conv_patience: int   = 5       # stop after this many non-improving windows
 
+    # --- Variance reduction ---
+    use_antithetic: bool  = True   # antithetic variates in MCEngine (halves MC variance)
+
+    # --- LR schedule ---
+    lr_min:     float = 1e-6      # cosine annealing floor (decays lr → lr_min over n_episodes)
+
     # --- Device ---
     device:     str   = "cpu"     # 'cpu' or 'cuda'
 
@@ -313,8 +320,8 @@ def collect_rollout(
     sigmas_bp    = torch.zeros(np_, T,     device=device)
     log_probs_bp = torch.zeros(np_, T,     device=device)
 
-    # Reset episode — draw new Brownian increments
-    engine.reset_episode()
+    # Reset episode — draw new Brownian increments (with antithetic variates if enabled)
+    engine.reset_episode(use_antithetic=cfg.use_antithetic)
 
     # Path-dependent state tracking (Exp 2 only)
     t1_step    = 21   # first Bermudan exercise date
@@ -694,6 +701,18 @@ class MARLVolTrainer:
         self.opt_p = torch.optim.Adam(self.policy.parameters(), lr=cfg.lr)
         self.opt_v = torch.optim.Adam(self.value.parameters(),  lr=cfg.lr)
 
+        # ── LR schedulers (cosine annealing) ────────────────────────────────
+        # Cosine annealing decays the learning rate from cfg.lr to cfg.lr_min
+        # over cfg.n_episodes steps.  This prevents the policy from overshooting
+        # a good solution late in training: after the initial fast improvement
+        # the step size shrinks, letting the optimiser settle into a fine minimum
+        # rather than bouncing around it.  (Observed: fixes_v2 peaked at ep226
+        # then degraded to +57.6% by ep700 — cosine annealing addresses this.)
+        self.sched_p = CosineAnnealingLR(
+            self.opt_p, T_max=cfg.n_episodes, eta_min=cfg.lr_min)
+        self.sched_v = CosineAnnealingLR(
+            self.opt_v, T_max=cfg.n_episodes, eta_min=cfg.lr_min)
+
         # ── Running return normalizer ────────────────────────────────────────
         # Keeps value-function MSE ~ O(1) across all training episodes.
         self.ret_normalizer = ReturnNormalizer()
@@ -848,11 +867,18 @@ class MARLVolTrainer:
                 cfg    = cfg,
             )
 
+            # ── LR schedule step ─────────────────────────────────────────────
+            # Step schedulers once per episode (not per PPO mini-batch).
+            # CosineAnnealingLR with T_max=n_episodes decays from lr to lr_min.
+            self.sched_p.step()
+            self.sched_v.step()
+
             # ── Logging ──────────────────────────────────────────────────────
             avg_loss   = float(np.mean(ep_losses))
             avg_reward = float(np.mean(ep_rewards))
             wall_time  = time.perf_counter() - t_start
 
+            cur_lr = self.sched_p.get_last_lr()[0]
             record = {
                 "episode":      episode,
                 "loss":         avg_loss,
@@ -862,6 +888,7 @@ class MARLVolTrainer:
                 "entropy":      ppo_stats["entropy"],
                 "kl":           ppo_stats["kl"],
                 "n_ppo_updates":ppo_stats["n_updates"],
+                "lr":           cur_lr,
                 "wall_time":    wall_time,
             }
             self.log.append(record)

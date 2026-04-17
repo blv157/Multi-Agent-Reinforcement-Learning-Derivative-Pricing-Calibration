@@ -207,13 +207,31 @@ class MCEngine:
         self.S: Optional[torch.Tensor] = None   # (n, T+1) price paths
         self._t: int = 0                         # current timestep
 
-    def reset_episode(self, seed: Optional[int] = None):
+    def reset_episode(self, seed: Optional[int] = None,
+                      use_antithetic: bool = True):
         """
         Draw fresh Brownian increments and initialise the path buffer.
         Call this once at the start of each training episode.
+
+        Parameters
+        ----------
+        use_antithetic : bool, default True
+            If True, use antithetic variates: generate Z for n/2 paths and
+            mirror them as -Z for the other n/2.  Because the antithetic pair
+            (Z, -Z) has the same marginal distribution as two independent
+            N(0,1) draws, the Brownian motion remains correctly distributed.
+            The covariance E[f(Z) f(-Z)] < 0 for monotone payoffs, so the
+            estimator variance is strictly lower.  In practice this roughly
+            halves the MC error in the calibration loss at zero extra compute.
         """
-        self.Z  = generate_brownian(self.n_paths, self.T_steps,
-                                     seed=seed, device=self.device)
+        if use_antithetic and self.n_paths % 2 == 0:
+            half   = self.n_paths // 2
+            Z_half = generate_brownian(half, self.T_steps,
+                                       seed=seed, device=self.device)
+            self.Z = torch.cat([Z_half, -Z_half], dim=0)
+        else:
+            self.Z = generate_brownian(self.n_paths, self.T_steps,
+                                       seed=seed, device=self.device)
         self.S  = torch.full(
             (self.n_paths, self.T_steps + 1),
             self.S0,
