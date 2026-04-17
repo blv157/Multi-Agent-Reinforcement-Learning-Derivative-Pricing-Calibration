@@ -56,7 +56,7 @@ from diffusion      import generate_brownian, simulate_paths, DELTA
 from options        import mc_call_prices
 from reward         import implied_vol_batch, calibration_loss
 from marl_vol       import MARLVolTrainer, TrainConfig
-from policy         import build_state_exp1
+from policy         import build_state_exp1, SIGMA_MIN, SIGMA_MAX
 
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -111,18 +111,21 @@ def plot_smile_comparison(
     print(f"\nGenerating smile comparison plot "
           f"({len(all_dte)} maturities, {N_ROWS}x{N_COLS} grid)...")
 
-    # Evaluation rollout (no noise)
+    # Evaluation rollout (no noise) — deterministic mean policy.
+    # policy(state) returns (mu_logsig, log_std): the MLP outputs the mean of
+    # log(sigma).  Convert to sigma via exp() before advancing paths.
     with torch.no_grad():
         Z      = generate_brownian(n_eval, cfg.T_steps, seed=999, device=device)
         sigmas = torch.zeros(n_eval, cfg.T_steps, device=device)
 
         S_cur = torch.full((n_eval,), S0, device=device)
         for t in range(cfg.T_steps):
-            state        = build_state_exp1(t, S_cur, cfg.T_steps, S0)
-            mu, _        = policy(state)
-            sigmas[:, t] = mu
+            state          = build_state_exp1(t, S_cur, cfg.T_steps, S0)
+            mu_logsig, _   = policy(state)
+            sigma_t        = torch.exp(mu_logsig).clamp(SIGMA_MIN, SIGMA_MAX)
+            sigmas[:, t]   = sigma_t
             S_cur = S_cur * torch.exp(
-                -0.5 * mu ** 2 * DELTA + mu * DELTA ** 0.5 * Z[:, t]
+                -0.5 * sigma_t ** 2 * DELTA + sigma_t * DELTA ** 0.5 * Z[:, t]
             )
 
         # Full price matrix
@@ -275,7 +278,7 @@ def main():
             n_basis    = 50,
             bp_method  = "knn",
             bp_k       = 1,
-            noise_std  = 0.02,
+            noise_std  = 1.0,  # unit noise; policy's own std scales exploration (paper eq. 15)
             lr         = 1e-4,
             clip       = 0.3,
             kl_target  = 0.01,
@@ -304,7 +307,7 @@ def main():
             n_basis     = 100,
             bp_method   = "knn",
             bp_k        = 1,
-            noise_std   = 0.02,
+            noise_std   = 1.0,  # unit noise; policy's own std scales exploration (paper eq. 15)
             lr          = 1e-4,
             clip        = 0.3,
             kl_target   = 0.01,

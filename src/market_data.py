@@ -245,7 +245,11 @@ class VolSurface:
         This DataFrame is fixed for the lifetime of the surface object and is
         the target that the calibration loss measures error against.
         """
-        target_moneyness = np.linspace(0.88, 1.12, n_strikes)
+        # Paper Figure 1 smile plots end at K/S ≈ 1.09.  Extending to 1.12
+        # includes deep OTM calls where MC noise dominates and IV inversion
+        # fails frequently, diluting the training signal.  Truncate to 1.09
+        # to match the paper and reduce noisy gradient contribution.
+        target_moneyness = np.linspace(0.88, 1.09, n_strikes)
         rows = []
 
         for dte, grp in self._df.groupby("maturity_days"):

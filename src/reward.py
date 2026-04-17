@@ -355,7 +355,17 @@ def reference_loss_bs(
         dtype=torch.float32, device=device,
     )
 
-    return calibration_loss(flat_px, mkt_px, denom=denom)
+    # IV-space reference loss — matches calibration_loss_iv used in training.
+    # We invert the flat BS prices back to IVs and compare to market IVs in
+    # implied-vol space, so L_ref and L_train are in the same units.
+    flat_ivs = implied_vol_batch(flat_px, S, strikes, T_years)
+    valid = ~torch.isnan(flat_ivs)
+    if valid.sum() < 5:
+        # Very rare fallback: if IV inversion fails for most instruments
+        mkt_px = torch.tensor(instruments["price_mkt"].values,
+                               dtype=torch.float32, device=device)
+        return calibration_loss(flat_px, mkt_px, denom=denom)
+    return ((flat_ivs[valid] - mkt_ivs[valid]) ** 2).mean()
 
 
 # ---------------------------------------------------------------------------

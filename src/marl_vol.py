@@ -105,7 +105,8 @@ from policy         import (PolicyNet, ValueNet,
                              build_state_exp1,
                              build_state_exp2_path_dependent,
                              build_state_exp2_nonpath,
-                             SIGMA_MIN, SIGMA_MAX)
+                             SIGMA_MIN, SIGMA_MAX,
+                             LOG_STD_MIN, LOG_STD_MAX)
 from basis_players  import BasisPlayerManager, interpolate_noise
 
 
@@ -348,16 +349,23 @@ def collect_rollout(
         policy.norm.update(state)
         value.norm.update(state)
 
-        # ── Policy mean for all trajectories ────────────────────────────────
-        mu, _ = policy(state)                            # (n,)
+        # ── Policy mean (log-sigma) for all trajectories ────────────────────
+        # Paper: ln sigma ~ N(mu_theta(x), sigma_pi^2).  The MLP outputs the
+        # mean of log(sigma), NOT sigma directly.
+        mu_logsig, _ = policy(state)                     # (n,)  log-sigma mean
 
-        # ── Basis player exploration noise ──────────────────────────────────
-        # epsilon is fixed for this episode (sampled above the loop)
-        W       = manager.compute_weights(state)         # (n, np)
-        noise   = interpolate_noise(W, epsilon)          # (n,)
+        # ── Policy-std-scaled basis player noise ─────────────────────────────
+        # Paper eq. 15: exploration = epsilon * sigma_pi (policy's own std).
+        # With noise_std=1 in config the raw epsilon ~ N(0,1); multiplying by
+        # policy_std gives proper exploration scaling that shrinks as the policy
+        # concentrates during training.
+        policy_std = policy.get_std()                    # scalar
+        W          = manager.compute_weights(state)      # (n, np)
+        noise      = interpolate_noise(W, epsilon)       # (n,) ~ N(0,1)
 
-        # ── Volatility actions ──────────────────────────────────────────────
-        sigma_t = (mu + noise).clamp(SIGMA_MIN, SIGMA_MAX)  # (n,)
+        # ── Volatility actions in log-sigma space ────────────────────────────
+        log_sigma = mu_logsig + noise * policy_std       # (n,)
+        sigma_t   = torch.exp(log_sigma).clamp(SIGMA_MIN, SIGMA_MAX)  # (n,)
 
         # ── Log-prob for basis players only ─────────────────────────────────
         bp_idx   = manager.basis_idx                     # (np,)
@@ -388,20 +396,24 @@ def collect_rollout(
     if cfg.experiment == "exp1":
         mc_px = mc_call_prices(S_full, grid, delta=cfg.delta)
 
-        # OTM-adjusted relative price loss.
-        # For K < S0 the denominator is the OTM put price (= call - intrinsic)
-        # rather than the ITM call price, giving equal gradient weight across
-        # both wings of the smile.  The IV tensors are retained for diagnostic
-        # use (smile plots) but are not used in the training loss.
-        loss_val = calibration_loss(mc_px, mkt_px, denom=mkt_otm).item()
+        # IV-space calibration loss — paper eq. 6 uses phi(X_hat) = BS IV mapping.
+        # Measures mean squared IV error across all calibration instruments.
+        # Falls back to OTM price loss (mkt_otm denominator) if IV inversion
+        # fails for too many instruments (rare but possible for deep OTM strikes).
+        loss_val = calibration_loss_iv(
+            mc_px, cfg.S0, inst_strikes, inst_T_years, inst_mkt_ivs,
+            fallback_denom=mkt_otm,
+        ).item()
 
-        # ── Reward: r = L_ref - L  (paper eq. 8) ────────────────────────────────
-        # Positive when the policy beats the flat BS baseline, negative when worse.
+        # ── Reward: r = (L_ref - L) / L_ref  (normalised percentage improvement)
+        # Normalising by L_ref makes the reward dimensionless and keeps its scale
+        # consistent regardless of the surface's absolute IV error magnitude.
+        # r = +1 would mean perfect calibration; r = 0 means flat BS performance.
         if l_ref is None:
             raw_r = torch.tensor(0.0, device=device)
         else:
             l_now = torch.tensor(loss_val, device=device)
-            raw_r = l_ref - l_now                            # scalar
+            raw_r = (l_ref - l_now) / l_ref                 # scalar, normalised
 
         rewards   = torch.zeros(n, T, device=device)
         rewards[:, -1] = raw_r                               # terminal reward

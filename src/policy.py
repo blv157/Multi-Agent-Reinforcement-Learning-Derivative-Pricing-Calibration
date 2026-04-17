@@ -205,23 +205,22 @@ class PolicyNet(nn.Module):
         state_dim:  int,
         hidden_dim: int   = HIDDEN_DIM,
         n_layers:   int   = N_LAYERS,
-        init_std:   float = 0.02,
+        init_std:   float = 0.20,
     ):
         super().__init__()
-        # MLP outputs the mean volatility
+        # MLP outputs the MEAN of log(sigma) — paper: ln sigma ~ N(mu_theta, sigma_pi^2)
         self.net     = _make_mlp(state_dim, 1, hidden_dim, n_layers)
-        # log_std is a free parameter (not state-dependent)
-        self.log_std = nn.Parameter(torch.tensor(float(torch.log(torch.tensor(init_std)))))
+        # log_std is the log of the policy exploration std (in log-sigma space).
+        # Initialise at log(init_std) so early std = init_std = 0.20.
+        import math
+        self.log_std = nn.Parameter(torch.tensor(math.log(init_std)))
         # Running normaliser for the input state
         self.norm    = RunningNormaliser(state_dim)
 
-        # Initialise the final layer so the policy starts near init_std vol.
-        # softplus(x) + SIGMA_MIN = init_std  =>  x = log(exp(init_std-SIGMA_MIN) - 1)
-        # For init_std=0.20, SIGMA_MIN=0.01: x = log(exp(0.19)-1) ≈ -1.565
-        # We set the output bias to this value and weights near zero.
-        import math
-        target = init_std - SIGMA_MIN
-        init_bias = math.log(math.exp(target) - 1.0) if target > 0.01 else -1.565
+        # Initialise MLP final layer so the policy starts at sigma ≈ init_std.
+        # With log(sigma) parameterisation, the MLP should output ≈ log(init_std).
+        # log(0.20) ≈ -1.609.  We set the bias to this and keep weights near zero.
+        init_bias = math.log(init_std)    # e.g. log(0.20) ≈ -1.609
         nn.init.uniform_(self.net[-1].weight, -0.01, 0.01)
         nn.init.constant_(self.net[-1].bias, init_bias)
 
@@ -233,15 +232,19 @@ class PolicyNet(nn.Module):
 
         Returns
         -------
-        mu     : (n,) mean volatility — passed through softplus to ensure > 0
-        log_std: scalar — shared across all states
+        mu_logsig : (n,) mean of log(sigma) — the MLP output directly
+                    (paper: ln sigma ~ N(mu_theta(x), sigma_pi^2))
+        log_std   : (n,) log of the policy exploration std, broadcast to n
         """
         state_norm = self.norm(state)
-        # Softplus maps R -> (0, inf), ensuring positive volatility mean
-        # We add SIGMA_MIN as a floor
-        raw_mu = self.net(state_norm).squeeze(-1)          # (n,)
-        mu     = torch.nn.functional.softplus(raw_mu) + SIGMA_MIN
-        return mu, self.log_std.expand_as(mu)
+        # Raw MLP output IS the log-sigma mean (no softplus).
+        # sigma is recovered as exp(mu_logsig), which is always positive.
+        mu_logsig = self.net(state_norm).squeeze(-1)       # (n,)
+        return mu_logsig, self.log_std.expand_as(mu_logsig)
+
+    def get_std(self) -> torch.Tensor:
+        """Return the current policy exploration std (scalar, in log-sigma space)."""
+        return self.log_std.clamp(LOG_STD_MIN, LOG_STD_MAX).exp()
 
     def get_distribution(self, state: torch.Tensor) -> Normal:
         """Return a Normal distribution object for the given states."""
@@ -253,21 +256,31 @@ class PolicyNet(nn.Module):
         """
         Sample volatilities and compute their log-probabilities.
 
+        With log(sigma) parameterisation:
+          1. Sample log_sigma ~ N(mu_logsig, std^2)
+          2. sigma = exp(log_sigma), clamped to [SIGMA_MIN, SIGMA_MAX]
+          3. log_prob = log p(log_sigma) = Normal(mu, std).log_prob(log_sigma)
+
         Returns
         -------
         sigma    : (n,) sampled volatilities, clamped to [SIGMA_MIN, SIGMA_MAX]
-        log_prob : (n,) log-probability of each sampled action
+        log_prob : (n,) log-probability of each sampled log-sigma
         """
-        dist     = self.get_distribution(state)
-        sigma_raw = dist.rsample()                          # reparameterised sample
-        log_prob  = dist.log_prob(sigma_raw)
-        sigma     = sigma_raw.clamp(SIGMA_MIN, SIGMA_MAX)
+        dist      = self.get_distribution(state)       # Normal over log-sigma
+        log_sigma = dist.rsample()                     # sample log-sigma
+        log_prob  = dist.log_prob(log_sigma)           # p(log_sigma)
+        sigma     = torch.exp(log_sigma).clamp(SIGMA_MIN, SIGMA_MAX)
         return sigma, log_prob
 
     def log_prob(self, state: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
         """
         Compute log-probability of given volatilities under the current policy.
         Used in the PPO importance-sampling ratio.
+
+        With log(sigma) parameterisation we evaluate the Normal(mu, std) PDF at
+        log(sigma) — not at sigma.  Both old and new log_probs use the same
+        formula, so the Jacobian term (-log sigma) cancels in the ratio
+        log(pi_new / pi_old), and importance sampling is exact.
 
         Parameters
         ----------
@@ -279,7 +292,7 @@ class PolicyNet(nn.Module):
         log_prob : (n,)
         """
         dist = self.get_distribution(state)
-        return dist.log_prob(sigma)
+        return dist.log_prob(torch.log(sigma.clamp(min=1e-8)))
 
     def entropy(self, state: torch.Tensor) -> torch.Tensor:
         """
