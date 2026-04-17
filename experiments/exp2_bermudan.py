@@ -223,7 +223,12 @@ BASE_CFG = dict(
     gamma          = 1.0,
     use_antithetic = True,      # antithetic variates for MC variance reduction
     experiment     = "exp2",
-    calib_weight   = 2.0,       # stronger Gyongy tether (2x calibration penalty)
+    calib_weight   = 5.0,       # strong Gyongy tether (5x calibration penalty)
+                               # Prevents sigma→0 exploitation: at σ≈0, berm_r→0 (+) but
+                               # calib_r→-2.0 (−), giving combined ≈ -10 vs +3.35 at market vol.
+                               # With calib_weight=2.0, the sigma→0 exploit has combined ≈ -4
+                               # which is only 4.7 worse than market; gradient is too weak.
+                               # With calib_weight=5.0, penalty is 13.35 worse; gradient is clear.
     n_episodes     = 2000,
     n_strikes      = 10,
     log_every      = 10,
