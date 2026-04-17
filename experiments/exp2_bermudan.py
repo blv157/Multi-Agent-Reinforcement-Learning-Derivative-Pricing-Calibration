@@ -70,42 +70,57 @@ from american_mc    import bermudan_price
 from reward         import implied_vol_batch, calibration_loss
 from marl_vol       import MARLVolTrainer, TrainConfig
 from policy         import (build_state_exp2_path_dependent,
-                             build_state_exp2_nonpath)
+                             build_state_exp2_nonpath,
+                             SIGMA_MIN, SIGMA_MAX)
 
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-RESULTS_DIR = "results/exp2"
-DATA_PATH   = "data/spx_smiles_clean.csv"
-DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Base PPO hyperparameters (same as Exp 1)
+# Dataset registry — mirrors exp1
+DATASETS = {
+    "aug2018": {
+        "path":  "data/spx_smiles_aug2018.csv",
+        "label": "Aug 2018 (CBOE EOD, spot=2813)",
+    },
+    "apr2026": {
+        "path":  "data/spx_smiles_clean.csv",
+        "label": "Apr 2026 (CBOE EOD, spot=6575)",
+    },
+}
+
+# Base PPO hyperparameters — aligned with fixes_v3 (exp1 best run)
 BASE_CFG = dict(
-    n_paths    = 120_000,
-    T_steps    = 51,
-    delta      = DELTA,
-    n_basis    = 100,
-    bp_method  = "knn",
-    bp_k       = 1,
-    noise_std  = 0.02,
-    lr         = 1e-4,
-    clip       = 0.3,
-    kl_target  = 0.01,
-    K_epochs   = 30,
-    B_envs     = 10,
-    mb_frac    = 0.1,
-    c_value    = 0.5,
-    c_entropy  = 0.01,
-    gamma      = 1.0,
-    experiment = "exp2",
-    n_episodes = 500,
-    n_strikes  = 10,
-    log_every  = 10,
-    save_every = 100,
-    save_dir   = RESULTS_DIR,
-    device     = DEVICE,
+    n_paths        = 120_000,
+    T_steps        = 51,        # needs t=51 for Bermudan exercise window t1=21..t2=51
+    delta          = DELTA,
+    n_basis        = 100,
+    bp_method      = "knn",
+    bp_k           = 1,
+    noise_std      = 1.0,       # unit noise; policy std scales exploration (fixes_v3)
+    lr             = 1e-4,
+    lr_min         = 1e-6,      # cosine annealing floor
+    clip           = 0.3,
+    kl_target      = 0.01,
+    K_epochs       = 30,
+    B_envs         = 10,
+    mb_frac        = 0.1,
+    c_value        = 0.5,
+    c_entropy      = 0.01,
+    gamma          = 1.0,
+    use_antithetic = True,      # antithetic variates for MC variance reduction
+    experiment     = "exp2",
+    n_episodes     = 2000,
+    n_strikes      = 10,
+    log_every      = 10,
+    save_every     = 100,
+    conv_window    = 100,
+    conv_tol       = 1e-3,
+    conv_patience  = 5,
+    device         = DEVICE,
 )
 
 
@@ -206,19 +221,21 @@ def plot_vol_surface_comparison(
                     state = build_state_exp2_nonpath(
                         t, S_cur, sigma_prev, cfg.T_steps, S0)
 
-                mu, _ = policy(state)
-                sigmas[:, t] = mu
+                mu_logsig, _ = policy(state)
+                # Policy outputs log(sigma) mean — convert to sigma
+                sigma_t = torch.exp(mu_logsig).clamp(SIGMA_MIN, SIGMA_MAX)
+                sigmas[:, t] = sigma_t
                 S_cur = S_cur * torch.exp(
-                    -0.5 * mu ** 2 * DELTA + mu * DELTA ** 0.5 * Z[:, t]
+                    -0.5 * sigma_t ** 2 * DELTA + sigma_t * DELTA ** 0.5 * Z[:, t]
                 )
                 S_paths[:, t + 1] = S_cur
-                sigma_prev = mu.clone()
+                sigma_prev = sigma_t.clone()
                 if t + 1 == t1:
                     S_at_t1   = S_cur.clone()
-                    sig_at_t1 = mu.clone()
+                    sig_at_t1 = sigma_t.clone()
 
-        # Plot smile for each maturity
-        moneyness_grid = np.linspace(0.88, 1.12, 40)
+        # Plot smile for each maturity — restrict to training range [0.88, 1.09]
+        moneyness_grid = np.linspace(0.88, 1.09, 50)
         K_grid = torch.tensor(moneyness_grid * S0, dtype=torch.float32, device=device)
 
         for col_idx, (dte_days, dte_years) in enumerate(
@@ -275,9 +292,10 @@ def plot_vol_surface_comparison(
 # ---------------------------------------------------------------------------
 
 def run_subexp(
-    surface:  VolSurface,
-    path_dep: bool,
-    tag:      str,
+    surface:     VolSurface,
+    path_dep:    bool,
+    tag:         str,
+    results_dir: str,
 ) -> tuple:
     """
     Train one Exp2 sub-experiment (path-dep or non-path-dep).
@@ -289,9 +307,8 @@ def run_subexp(
         state_dim  = state_dim,
         path_dep   = path_dep,
         S0         = surface.spot,
+        save_dir   = results_dir,
     )
-    # Update save dir tag for separate checkpoints
-    cfg.save_dir = RESULTS_DIR
 
     bermudan = make_bermudan(
         strike    = surface.spot,
@@ -304,7 +321,8 @@ def run_subexp(
     print(f"{'='*60}")
 
     trainer = MARLVolTrainer(surface=surface, cfg=cfg, bermudan=bermudan)
-    # Tag checkpoints with sub-experiment name
+    # Tag checkpoints with sub-experiment name so path-dep / non-path-dep
+    # checkpoints don't overwrite each other
     trainer.cfg.experiment = f"exp2_{tag}"
     log = trainer.train()
 
@@ -317,16 +335,31 @@ def run_subexp(
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Experiment 2: Bermudan Option Price Minimisation",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--mode", choices=["both", "path_dep", "non_path_dep"],
                         default="both",
-                        help="Which sub-experiment to run")
+                        help="Which sub-experiment to run (default: both)")
+    parser.add_argument("--dataset", choices=list(DATASETS.keys()),
+                        default="aug2018",
+                        help="Market data to train on (default: aug2018)")
+    parser.add_argument("--tag", type=str, default="",
+                        help="Optional suffix for results directory")
     args = parser.parse_args()
+
+    ds_cfg     = DATASETS[args.dataset]
+    DATA_PATH  = ds_cfg["path"]
+    DATA_LABEL = ds_cfg["label"]
+    tag_suffix = f"_{args.tag}" if args.tag else ""
+    RESULTS_DIR = f"results/exp2_{args.dataset}{tag_suffix}"
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
     print("=" * 60)
     print("Experiment 2: Bermudan Option Price Minimisation")
     print("=" * 60)
+    print(f"Dataset: {args.dataset}  ({DATA_LABEL})")
     print(f"Device : {DEVICE}")
     print(f"Mode   : {args.mode}")
     print(f"Results: {RESULTS_DIR}\n")
@@ -338,12 +371,14 @@ def main():
     trainers  = {}
 
     if args.mode in ("both", "path_dep"):
-        trainer_pd, log_pd = run_subexp(surface, path_dep=True,  tag="path_dep")
+        trainer_pd, log_pd = run_subexp(surface, path_dep=True,
+                                         tag="path_dep", results_dir=RESULTS_DIR)
         log_dfs["path_dep"]  = log_pd
         trainers["path_dep"] = trainer_pd
 
     if args.mode in ("both", "non_path_dep"):
-        trainer_npd, log_npd = run_subexp(surface, path_dep=False, tag="non_path_dep")
+        trainer_npd, log_npd = run_subexp(surface, path_dep=False,
+                                           tag="non_path_dep", results_dir=RESULTS_DIR)
         log_dfs["non_path_dep"]  = log_npd
         trainers["non_path_dep"] = trainer_npd
 
