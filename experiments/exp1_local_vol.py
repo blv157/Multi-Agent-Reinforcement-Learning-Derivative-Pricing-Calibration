@@ -253,19 +253,24 @@ def main():
         "--small", action="store_true",
         help="Fast diagnostic run (10k paths, 500 episodes)",
     )
+    parser.add_argument(
+        "--tag", type=str, default="",
+        help="Optional suffix appended to results directory (e.g. 'fixes_v1')",
+    )
     args = parser.parse_args()
 
     ds_cfg      = DATASETS[args.dataset]
     DATA_PATH   = ds_cfg["path"]
     DATA_LABEL  = ds_cfg["label"]
     OOS_KEY     = ds_cfg["oos_key"]
-    RESULTS_DIR = f"results/exp1_{args.dataset}"
+    tag_suffix  = f"_{args.tag}" if args.tag else ""
+    RESULTS_DIR = f"results/exp1_{args.dataset}{tag_suffix}"
 
     if args.small:
         RESULTS_DIR = RESULTS_DIR + "_small"
         CFG = TrainConfig(
             n_paths    = 10_000,
-            T_steps    = 51,
+            T_steps    = 47,   # matches longest calibration maturity (47 DTE)
             delta      = DELTA,
             n_basis    = 50,
             bp_method  = "knn",
@@ -294,7 +299,7 @@ def main():
     else:
         CFG = TrainConfig(
             n_paths     = 120_000,
-            T_steps     = 51,
+            T_steps     = 47,   # matches longest calibration maturity (47 DTE)
             delta       = DELTA,
             n_basis     = 100,
             bp_method   = "knn",

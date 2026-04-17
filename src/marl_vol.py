@@ -321,17 +321,15 @@ def collect_rollout(
     S_at_t1    = torch.full((n,), S0,   device=device)  # price frozen at t1
     sig_at_t1  = torch.full((n,), 0.20, device=device)  # sigma frozen at t1
 
-    # Sample basis player noise ONCE per episode (not per timestep).
-    # The paper's eq. 15 writes epsilon_j with no time subscript — each basis
-    # player maintains a fixed noise offset throughout the episode.  This means
-    # each player consistently explores a slightly shifted sigma function,
-    # creating a clean causal link between its noise and the calibration loss
-    # it produces.  Per-timestep noise would average out over T steps, making
-    # it nearly impossible to attribute outcome differences to specific players.
-    epsilon = manager.sample_noise()                     # (np,)  fixed for episode
-
     for t in range(T):
         S_t = engine.current_prices                      # (n,)
+
+        # Sample basis player noise at EVERY timestep, matching Algorithm 1
+        # equation 15 which writes epsilon_j(t) with an explicit time subscript.
+        # Per-timestep noise lets agents independently explore different
+        # sigma(t, S_t) values at each (time, price) point of the local vol
+        # surface, giving richer coverage than a fixed per-episode offset.
+        epsilon = manager.sample_noise()                 # (np,)  fresh each step
 
         # ── Build state ─────────────────────────────────────────────────────
         if cfg.experiment == "exp1":
@@ -803,8 +801,13 @@ class MARLVolTrainer:
             #   - Rollouts with high calibration loss → low G  → raw A = G - V is small
             # After cross-rollout normalisation these differences survive and
             # the policy gradient correctly points toward the better rollouts.
+            #
+            # Standard PPO normalisation: divide by (std + eps) so advantages
+            # are scaled to unit variance regardless of the reward spread.
+            # Previous clamp(min=1) was non-standard and suppressed gradients
+            # when inter-rollout reward variation was small (near convergence).
             adv_flat = adv_all.flatten()
-            adv_flat = (adv_flat - adv_flat.mean()) / adv_flat.std().clamp(min=1)
+            adv_flat = (adv_flat - adv_flat.mean()) / (adv_flat.std() + 1e-8)
             adv_all  = adv_flat.reshape_as(adv_all)
 
             buffer = RolloutBuffer(
