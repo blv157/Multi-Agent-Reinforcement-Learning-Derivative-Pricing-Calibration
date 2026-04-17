@@ -227,6 +227,14 @@ class TrainConfig:
     # --- LR schedule ---
     lr_min:     float = 1e-6      # cosine annealing floor (decays lr → lr_min over n_episodes)
 
+    # --- Exp2 Gyongy calibration weight ---
+    # Combined reward for exp2: r = bermudan_reward + calib_weight * calib_reward
+    # bermudan_reward = -b_price / b_ref  (normalised; ref = European ATM call price)
+    # calib_reward    = (L_ref - L_calib) / L_ref  (same as exp1)
+    # calib_weight=1.0 balances the two objectives equally.  Higher values force
+    # tighter calibration at the cost of a less aggressive Bermudan minimisation.
+    calib_weight: float = 1.0
+
     # --- Device ---
     device:     str   = "cpu"     # 'cpu' or 'cuda'
 
@@ -292,6 +300,7 @@ def collect_rollout(
     inst_strikes:  Optional[torch.Tensor] = None,
     inst_T_years:  Optional[torch.Tensor] = None,
     inst_mkt_ivs:  Optional[torch.Tensor] = None,
+    l_ref_berm:    Optional[float]        = None,  # exp2: European call reference price
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor,
     torch.Tensor, float, float
@@ -428,11 +437,49 @@ def collect_rollout(
 
     else:  # exp2
         assert bermudan is not None, "BermudanSpec required for exp2"
+
+        # ── Bermudan price (Longstaff-Schwartz) ──────────────────────────────
         b_price, _ = bermudan_price(S_full, bermudan, degree=8, S0=S0)
-        b_price_t  = torch.tensor(b_price, device=device)
         loss_val   = b_price
-        rewards    = compute_rewards_bermudan(b_price_t, n_paths=n, T_steps=T)
-        episode_r  = rewards[0, -1].item()
+
+        # ── Gyongy calibration constraint ────────────────────────────────────
+        # The Bermudan reward alone lets the policy trivially minimise by
+        # setting σ→0 (making the call worthless).  Gyongy's theorem says
+        # calibration holds iff the empirical marginal distributions of S
+        # match the market.  We enforce this via an exp1-style IV calibration
+        # loss computed on the SAME paths used for Bermudan pricing.
+        #
+        # Combined reward:
+        #   r = bermudan_reward + calib_weight * calib_reward
+        #   bermudan_reward = -b_price / b_ref  (normalised; ref = European ATM)
+        #   calib_reward    = (L_ref - L_calib) / L_ref  (same as exp1)
+        #
+        # This jointly minimises the Bermudan price while keeping the vol
+        # surface calibrated — replicating the spirit of Gyongy localisation
+        # in the paper.
+        mc_px = mc_call_prices(S_full, grid, delta=cfg.delta)
+        calib_val = calibration_loss_iv(
+            mc_px, cfg.S0, inst_strikes, inst_T_years, inst_mkt_ivs,
+            fallback_denom=mkt_otm,
+        ).item()
+
+        # Bermudan reward: normalise by European call reference (≈1 at start)
+        b_ref_val = l_ref_berm if (l_ref_berm is not None and l_ref_berm > 0) else 1.0
+        berm_r = -b_price / b_ref_val
+
+        # Calibration reward (same sign convention as exp1: higher = better)
+        if l_ref is not None:
+            l_ref_val = l_ref.item() if torch.is_tensor(l_ref) else l_ref
+            calib_r   = (l_ref_val - calib_val) / l_ref_val if l_ref_val > 0 else 0.0
+        else:
+            calib_r = 0.0
+
+        combined_r = berm_r + cfg.calib_weight * calib_r
+        raw_r_t    = torch.tensor(combined_r, device=device)
+
+        rewards    = torch.zeros(n, T, device=device)
+        rewards[:, -1] = raw_r_t
+        episode_r  = raw_r_t.item()
 
     return states_bp, sigmas_bp, log_probs_bp, rewards, loss_val, episode_r
 
@@ -689,6 +736,20 @@ class MARLVolTrainer:
                                        denom=self.mkt_otm)
         print(f"Reference loss (BS flat smile): {self.l_ref.item():.6f}")
 
+        # ── Exp2: European call reference price for Bermudan normalisation ───
+        # The Bermudan reward is normalised by the European ATM call price so
+        # that bermudan_reward ≈ -1 at the start (price ~ European) and
+        # improves toward 0 as training minimises the Bermudan price.
+        # This keeps the Bermudan and calibration rewards on a similar scale.
+        self.l_ref_berm: Optional[float] = None
+        if cfg.experiment.startswith("exp2"):
+            from market_data import bs_call_vectorised
+            T_berm = cfg.T_steps * cfg.delta
+            sigma_atm = surface.get_iv(cfg.S0, T_berm)
+            self.l_ref_berm = float(bs_call_vectorised(cfg.S0, cfg.S0, T_berm, sigma_atm))
+            print(f"Bermudan reference (European ATM call, T={cfg.T_steps}d): "
+                  f"{self.l_ref_berm:.4f}")
+
         # ── Policy and value networks ────────────────────────────────────────
         self.policy = PolicyNet(state_dim=cfg.state_dim).to(device)
         self.value  = ValueNet(state_dim=cfg.state_dim).to(device)
@@ -800,6 +861,7 @@ class MARLVolTrainer:
                     inst_strikes  = self.inst_strikes,
                     inst_T_years  = self.inst_T_years,
                     inst_mkt_ivs  = self.inst_mkt_ivs,
+                    l_ref_berm    = self.l_ref_berm,
                 )
 
                 # Track return statistics (for logging/diagnostics only)
