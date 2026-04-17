@@ -31,7 +31,7 @@ Run:
     python scripts/generate_plots_v2.py
 """
 
-import os, sys
+import os, sys, argparse
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
@@ -46,30 +46,64 @@ from policy      import build_state_exp1, SIGMA_MIN, SIGMA_MAX
 from marl_vol    import MARLVolTrainer
 from options     import call_payoff_grid
 
+# ---------------------------------------------------------------------------
+# CLI args — override defaults to regenerate plots for any run tag
+# ---------------------------------------------------------------------------
+_parser = argparse.ArgumentParser(description="Generate corrected smile plots")
+_parser.add_argument("--tag",      default="fixes_v2",
+                     help="Run tag (subdirectory under results/exp1_aug2018_<tag>)")
+_parser.add_argument("--ckpt",     default="",
+                     help="Override checkpoint path (default: results/exp1_aug2018_<tag>/exp1_best.pt)")
+_parser.add_argument("--n-eval",   type=int, default=400_000,
+                     help="Paths per stochastic rollout (default 400k)")
+_parser.add_argument("--b-eval",   type=int, default=5,
+                     help="Number of stochastic rollouts to average (default 5)")
+_args = _parser.parse_args()
+
 DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
-CKPT_PATH   = "results/exp1_aug2018_fixes_v2/exp1_best.pt"
+RESULTS_DIR = f"results/exp1_aug2018_{_args.tag}"
+CKPT_PATH   = _args.ckpt or f"{RESULTS_DIR}/exp1_best.pt"
 DATA_PATH   = "data/spx_smiles_aug2018.csv"
 OOS_PATH    = "data/spx_smiles_clean.csv"
-RESULTS_DIR = "results/exp1_aug2018_fixes_v2"
-N_EVAL      = 400_000   # paths per stochastic rollout (more = smoother)
-B_EVAL      = 5         # stochastic rollouts to average
+N_EVAL      = _args.n_eval   # paths per stochastic rollout (more = smoother)
+B_EVAL      = _args.b_eval   # stochastic rollouts to average
 
 
 # ---------------------------------------------------------------------------
 # Load checkpoint
 # ---------------------------------------------------------------------------
 
-def load_best(ckpt_path, surface):
+def load_best(ckpt_path, surface, results_dir=None):
     ckpt    = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
     cfg     = ckpt["cfg"]
     cfg.device = DEVICE
     trainer = MARLVolTrainer(surface=surface, cfg=cfg)
     trainer.policy.load_state_dict(ckpt["policy"])
     trainer.policy.norm.load_state_dict(ckpt["policy_norm"])
-    ep = ckpt["episode"]
-    r  = max(r["reward"] for r in ckpt["log"])
-    print(f"  Loaded ep {ep}  best_reward={r:+.4f}  ({r*100:.1f}%)")
-    return trainer, ckpt["log"]
+    ep      = ckpt["episode"]
+    log     = ckpt["log"]
+    best_r  = max(r["reward"] for r in log)
+    print(f"  Loaded ep {ep}  best_reward={best_r:+.4f}  ({best_r*100:.1f}%)")
+
+    # Try to load the full training log from the last periodic checkpoint
+    # (exp1_best.pt only has entries up to the best episode; the full run
+    # may have continued for many more episodes — use the last ep*.pt for
+    # the complete learning curve.)
+    if results_dir is not None:
+        import glob as _glob
+        ep_ckpts = sorted(
+            _glob.glob(os.path.join(results_dir, "exp1_ep*.pt")),
+            key=lambda p: int(p.split("_ep")[-1].split(".")[0]),
+        )
+        if ep_ckpts:
+            last_ckpt = torch.load(ep_ckpts[-1], map_location="cpu", weights_only=False)
+            full_log  = last_ckpt.get("log", log)
+            if len(full_log) > len(log):
+                print(f"  Using full log from {os.path.basename(ep_ckpts[-1])} "
+                      f"({len(full_log)} episodes)")
+                log = full_log
+
+    return trainer, log, ep, best_r
 
 
 # ---------------------------------------------------------------------------
@@ -333,14 +367,23 @@ def plot_interp_grid(trainer, surface, save_path, data_label="",
 # Plot 3: Learning curve (clean replot)
 # ---------------------------------------------------------------------------
 
-def plot_learning_curve_v2(log, save_path, l_ref):
+def plot_learning_curve_v2(log, save_path, l_ref, tag="", best_ep=None, best_r=None):
     episodes = [r["episode"] for r in log]
     losses   = [r["loss"]    for r in log]
     rewards  = [r["reward"]  for r in log]
 
-    # Smoothed reward (50-ep rolling mean)
-    smooth = np.convolve(rewards, np.ones(50)/50, mode="valid")
-    smooth_ep = episodes[49:]
+    if best_ep is None:
+        best_ep = max(log, key=lambda r: r["reward"])["episode"]
+    if best_r is None:
+        best_r  = max(r["reward"] for r in log)
+
+    # Smoothed reward (50-ep rolling mean, falls back to shorter window)
+    win = min(50, len(rewards) // 2)
+    if win > 1:
+        smooth    = np.convolve(rewards, np.ones(win)/win, mode="valid")
+        smooth_ep = episodes[win - 1:]
+    else:
+        smooth, smooth_ep = rewards, episodes
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
 
@@ -349,7 +392,11 @@ def plot_learning_curve_v2(log, save_path, l_ref):
     ax1.axhline(l_ref, color="tomato", linestyle="--", linewidth=1.5,
                 label=f"BS baseline L_ref={l_ref:.4f}")
     ax1.set_ylabel("Calibration loss (IV space)")
-    ax1.set_title("Experiment 1 — fixes_v2: Learning Curve  (best: ep 226, +92.4%)")
+    run_label = f"  [{tag}]" if tag else ""
+    ax1.set_title(
+        f"Experiment 1{run_label}: Learning Curve  "
+        f"(best: ep {best_ep}, {best_r*100:.1f}%)"
+    )
     ax1.legend(fontsize=9)
     ax1.grid(True, alpha=0.3)
     ax1.set_yscale("log")
@@ -357,10 +404,10 @@ def plot_learning_curve_v2(log, save_path, l_ref):
     ax2.plot(episodes, rewards, color="seagreen", linewidth=0.8, alpha=0.4,
              label="Episode reward")
     ax2.plot(smooth_ep, smooth, color="darkgreen", linewidth=2,
-             label="50-ep rolling mean")
+             label=f"{win}-ep rolling mean")
     ax2.axhline(0, color="black", linestyle="--", linewidth=1)
-    ax2.axvline(226, color="tomato", linestyle=":", linewidth=1.5,
-                label="Best ep (226, +92.4%)")
+    ax2.axvline(best_ep, color="tomato", linestyle=":", linewidth=1.5,
+                label=f"Best ep ({best_ep}, {best_r*100:.1f}%)")
     ax2.set_ylabel("Normalised reward  (L_ref - L) / L_ref")
     ax2.set_xlabel("Episode")
     ax2.legend(fontsize=9)
@@ -388,7 +435,8 @@ if __name__ == "__main__":
     surface.summary()
 
     print("\nLoading checkpoint...")
-    trainer, log = load_best(CKPT_PATH, surface)
+    trainer, log, best_ep, best_r = load_best(CKPT_PATH, surface,
+                                               results_dir=RESULTS_DIR)
 
     # Learning curve
     l_ref_val = trainer.l_ref.item()
@@ -396,6 +444,9 @@ if __name__ == "__main__":
         log,
         save_path=os.path.join(RESULTS_DIR, "exp1_learning_curve_v2.png"),
         l_ref=l_ref_val,
+        tag=_args.tag,
+        best_ep=best_ep,
+        best_r=best_r,
     )
 
     # Focused 1x5 calibration plot (in-sample)
