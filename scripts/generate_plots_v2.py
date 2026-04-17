@@ -47,24 +47,41 @@ from marl_vol    import MARLVolTrainer
 from options     import call_payoff_grid
 
 # ---------------------------------------------------------------------------
-# CLI args — override defaults to regenerate plots for any run tag
+# CLI args — override defaults to regenerate plots for any run/dataset
 # ---------------------------------------------------------------------------
+_DATASETS = {
+    "aug2018": {
+        "data":    "data/spx_smiles_aug2018.csv",
+        "oos":     "data/spx_smiles_clean.csv",
+        "oos_label": "Apr 2026 (out-of-sample)",
+    },
+    "apr2026": {
+        "data":    "data/spx_smiles_clean.csv",
+        "oos":     "data/spx_smiles_aug2018.csv",
+        "oos_label": "Aug 2018 (out-of-sample)",
+    },
+}
+
 _parser = argparse.ArgumentParser(description="Generate corrected smile plots")
+_parser.add_argument("--dataset",  default="aug2018", choices=list(_DATASETS.keys()),
+                     help="Which dataset the model was trained on (default: aug2018)")
 _parser.add_argument("--tag",      default="fixes_v2",
-                     help="Run tag (subdirectory under results/exp1_aug2018_<tag>)")
+                     help="Run tag suffix (default: fixes_v2)")
 _parser.add_argument("--ckpt",     default="",
-                     help="Override checkpoint path (default: results/exp1_aug2018_<tag>/exp1_best.pt)")
+                     help="Override checkpoint path (default: results/exp1_<dataset>_<tag>/exp1_best.pt)")
 _parser.add_argument("--n-eval",   type=int, default=400_000,
                      help="Paths per stochastic rollout (default 400k)")
 _parser.add_argument("--b-eval",   type=int, default=5,
                      help="Number of stochastic rollouts to average (default 5)")
 _args = _parser.parse_args()
 
+_ds      = _DATASETS[_args.dataset]
 DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
-RESULTS_DIR = f"results/exp1_aug2018_{_args.tag}"
+RESULTS_DIR = f"results/exp1_{_args.dataset}_{_args.tag}"
 CKPT_PATH   = _args.ckpt or f"{RESULTS_DIR}/exp1_best.pt"
-DATA_PATH   = "data/spx_smiles_aug2018.csv"
-OOS_PATH    = "data/spx_smiles_clean.csv"
+DATA_PATH   = _ds["data"]
+OOS_PATH    = _ds["oos"]
+OOS_LABEL   = _ds["oos_label"]
 N_EVAL      = _args.n_eval   # paths per stochastic rollout (more = smoother)
 B_EVAL      = _args.b_eval   # stochastic rollouts to average
 
@@ -468,10 +485,11 @@ if __name__ == "__main__":
     # OOS focused plot (Apr 2026)
     if os.path.exists(OOS_PATH):
         surface_oos = VolSurface(OOS_PATH)
+        oos_tag = "aug2018" if _args.dataset == "apr2026" else "apr2026"
         plot_calib_focused(
             trainer, surface_oos,
-            save_path=os.path.join(RESULTS_DIR, "exp1_smile_calib_v2_oos_apr2026.png"),
-            data_label="Apr 2026 (out-of-sample)",
+            save_path=os.path.join(RESULTS_DIR, f"exp1_smile_calib_v2_oos_{oos_tag}.png"),
+            data_label=OOS_LABEL,
             n_eval=N_EVAL, b_eval=B_EVAL,
         )
 

@@ -75,6 +75,105 @@ from policy         import (build_state_exp2_path_dependent,
 
 
 # ---------------------------------------------------------------------------
+# Warm-start helper
+# ---------------------------------------------------------------------------
+
+def warm_start_from_exp1(trainer: MARLVolTrainer, exp1_ckpt_path: str) -> None:
+    """
+    Initialise the exp2 policy from a trained exp1 checkpoint.
+
+    Why this is needed
+    ------------------
+    Exp2 starts from a randomly-initialised policy, which outputs sigma ≈ exp(0) ≈ 1%
+    (the network bias is near zero).  With the combined Bermudan + calibration reward,
+    the calibration gradient strongly drives sigma upward toward market vol (~20%), but
+    the policy overshoots to ~50% before the Bermudan penalty can compensate.  Once
+    sigma > 30%, both rewards are deeply negative and clipped, the value function
+    diverges, and training never recovers.
+
+    By warm-starting from the trained exp1 policy (which already knows how to output
+    calibration-appropriate sigma values), we start exp2 in the well-calibrated regime:
+      - Bermudan reward ≈ -1  (b_price ≈ European ref, since sigma ≈ market vol)
+      - Calib reward  ≈ +0.5..+0.9  (already calibrated)
+      - Combined      ≈ -0.5  (small negative, much better than -2.75)
+
+    PPO then only needs to fine-tune the sigma surface shape to further reduce the
+    Bermudan price, which is a much easier optimisation problem.
+
+    Implementation
+    --------------
+    - exp1 policy: state_dim=2  (net.0.weight: [50, 2])
+    - exp2 policy: state_dim=3 or 5  (net.0.weight: [50, 3 or 5])
+    - Copy first 2 input columns from exp1; zero-init the extra columns so that
+      the additional state features (sigma_prev, S_at_t1, sig_at_t1) start with
+      zero influence.  All other layers (hidden + output) are copied directly.
+    - The state normalizer is extended: first 2 features get exp1 learned mean/var;
+      extra features get neutral warm-prior (sigma_prev ≈ 0.10 of SIGMA_MAX, ATM).
+    - The VALUE network is NOT warm-started: the exp2 reward scale is completely
+      different from exp1, so exp1 value estimates would be misleading.  The value
+      network learns from scratch but quickly adapts (it has a very high MSE loss
+      initially which drives rapid correction).
+    """
+    ckpt = torch.load(exp1_ckpt_path, map_location="cpu", weights_only=False)
+
+    # ── Policy network weights ────────────────────────────────────────────────
+    sd1 = ckpt["policy"]                          # exp1 weights (state_dim=2)
+    sd2 = trainer.policy.state_dict()            # exp2 weights (state_dim=3 or 5)
+
+    for key in sd2:
+        if key not in sd1:
+            continue
+        v1, v2 = sd1[key], sd2[key]
+        if v1.shape == v2.shape:
+            sd2[key] = v1.clone()                 # identical layers: copy directly
+        elif key == "net.0.weight":
+            # First layer: [50, 2] → [50, 3 or 5]
+            # Copy first 2 columns; zero-init the extra exp2-only features
+            new_w = torch.zeros_like(v2)
+            new_w[:, : v1.shape[1]] = v1
+            sd2[key] = new_w
+
+    trainer.policy.load_state_dict(sd2)
+
+    # ── Policy state normalizer ───────────────────────────────────────────────
+    norm1 = ckpt["policy_norm"]
+    n1    = norm1["mean"].shape[0]         # 2
+    n2    = trainer.cfg.state_dim          # 3 or 5
+
+    new_mean  = torch.zeros(n2)
+    new_var   = torch.ones(n2)
+    new_mean[: n1] = norm1["mean"]
+    new_var[: n1]  = norm1["var"]
+
+    # Extra features warm-prior (index meaning depends on exp2 state builder)
+    if n2 > n1:                            # sigma_prev / SIGMA_MAX
+        new_mean[n1]   = 0.10              # ~20% vol / 200% max
+        new_var[n1]    = 0.002
+    if n2 > n1 + 1:                        # S_at_t1 / S0
+        new_mean[n1 + 1] = 1.00
+        new_var[n1 + 1]  = 0.0022
+    if n2 > n1 + 2:                        # sig_at_t1 / SIGMA_MAX
+        new_mean[n1 + 2] = 0.10
+        new_var[n1 + 2]  = 0.002
+
+    norm2_sd           = trainer.policy.norm.state_dict()
+    norm2_sd["mean"]   = new_mean
+    norm2_sd["var"]    = new_var
+    norm2_sd["count"]  = norm1["count"]   # inherit count → normaliser stays stable
+    trainer.policy.norm.load_state_dict(norm2_sd)
+
+    # ── Value state normalizer (same extension as policy norm) ────────────────
+    norm2v_sd           = trainer.value.norm.state_dict()
+    norm2v_sd["mean"]   = new_mean.clone()
+    norm2v_sd["var"]    = new_var.clone()
+    norm2v_sd["count"]  = norm1["count"]
+    trainer.value.norm.load_state_dict(norm2v_sd)
+
+    print(f"  Warm-started exp2 policy from: {exp1_ckpt_path}")
+    print(f"  exp1 state_dim=2 -> exp2 state_dim={n2}; extra input cols zero-init")
+
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
@@ -93,15 +192,26 @@ DATASETS = {
 }
 
 # Base PPO hyperparameters — aligned with fixes_v3 (exp1 best run)
+# Key exp2 differences from exp1:
+#   n_paths=40_000: fewer paths than exp1's 120k.  With 120k + antithetic variates the
+#               Bermudan MC estimates become so precise that all B=10 rollouts yield
+#               nearly identical rewards → PPO gradient ≈ 0 → policy random-walks and
+#               diverges.  40k paths retain enough MC noise to create reward variance
+#               across rollouts (PPO gets a clear gradient signal) while still
+#               producing accurate enough LS Bermudan estimates.
+#   lr=5e-5     (half of exp1): prevents sigma from overshooting market vol during
+#               the first 20–50 episodes when the combined reward gradient is noisy.
+#   calib_weight=2.0: stronger Gyongy tether ensures calibration is maintained even
+#               when the Bermudan gradient tries to push sigma below market vol.
 BASE_CFG = dict(
-    n_paths        = 120_000,
+    n_paths        = 40_000,
     T_steps        = 51,        # needs t=51 for Bermudan exercise window t1=21..t2=51
     delta          = DELTA,
     n_basis        = 100,
     bp_method      = "knn",
     bp_k           = 1,
     noise_std      = 1.0,       # unit noise; policy std scales exploration (fixes_v3)
-    lr             = 1e-4,
+    lr             = 5e-5,      # half of exp1: avoids overshoot in early Bermudan training
     lr_min         = 1e-6,      # cosine annealing floor
     clip           = 0.3,
     kl_target      = 0.01,
@@ -113,6 +223,7 @@ BASE_CFG = dict(
     gamma          = 1.0,
     use_antithetic = True,      # antithetic variates for MC variance reduction
     experiment     = "exp2",
+    calib_weight   = 2.0,       # stronger Gyongy tether (2x calibration penalty)
     n_episodes     = 2000,
     n_strikes      = 10,
     log_every      = 10,
@@ -292,14 +403,31 @@ def plot_vol_surface_comparison(
 # ---------------------------------------------------------------------------
 
 def run_subexp(
-    surface:     VolSurface,
-    path_dep:    bool,
-    tag:         str,
-    results_dir: str,
+    surface:        VolSurface,
+    path_dep:       bool,
+    tag:            str,
+    results_dir:    str,
+    exp1_ckpt_path: str = "",
 ) -> tuple:
     """
     Train one Exp2 sub-experiment (path-dep or non-path-dep).
-    Returns (trainer, log_df).
+
+    Parameters
+    ----------
+    surface        : VolSurface for the dataset
+    path_dep       : True for path-dependent state (dim=5), False for dim=3
+    tag            : checkpoint filename prefix  ('path_dep' or 'non_path_dep')
+    results_dir    : directory to save checkpoints and plots
+    exp1_ckpt_path : optional path to exp1 best checkpoint for warm-starting the
+                     policy.  If given and the file exists, the exp2 policy is
+                     initialised from the exp1 weights (first 2 input features
+                     copied; extra features zero-initialised).  This prevents
+                     sigma from diverging away from the calibrated regime during
+                     the early training episodes.
+
+    Returns
+    -------
+    (trainer, log_df)
     """
     state_dim = 5 if path_dep else 3
     cfg = TrainConfig(
@@ -318,12 +446,22 @@ def run_subexp(
 
     print(f"\n{'='*60}")
     print(f"Sub-experiment: {tag}  (state_dim={state_dim})")
+    print(f"  lr={cfg.lr}  calib_weight={cfg.calib_weight}")
     print(f"{'='*60}")
 
     trainer = MARLVolTrainer(surface=surface, cfg=cfg, bermudan=bermudan)
     # Tag checkpoints with sub-experiment name so path-dep / non-path-dep
     # checkpoints don't overwrite each other
     trainer.cfg.experiment = f"exp2_{tag}"
+
+    # Optional warm-start from exp1 calibration checkpoint
+    if exp1_ckpt_path and os.path.exists(exp1_ckpt_path):
+        warm_start_from_exp1(trainer, exp1_ckpt_path)
+    else:
+        if exp1_ckpt_path:
+            print(f"  WARNING: exp1 ckpt not found at {exp1_ckpt_path}; "
+                  f"training from random init")
+
     log = trainer.train()
 
     log_df = pd.DataFrame(log)
@@ -347,6 +485,14 @@ def main():
                         help="Market data to train on (default: aug2018)")
     parser.add_argument("--tag", type=str, default="",
                         help="Optional suffix for results directory")
+    parser.add_argument(
+        "--exp1_ckpt", type=str, default="",
+        help=(
+            "Path to exp1 best checkpoint for warm-starting the exp2 policy. "
+            "Example: results/exp1_aug2018_fixes_v3/exp1_best.pt  "
+            "Strongly recommended: prevents sigma from diverging during early training."
+        ),
+    )
     args = parser.parse_args()
 
     ds_cfg     = DATASETS[args.dataset]
@@ -370,15 +516,27 @@ def main():
     log_dfs   = {}
     trainers  = {}
 
+    exp1_ckpt = args.exp1_ckpt
+    # Auto-detect exp1 checkpoint when --exp1_ckpt is not specified
+    if not exp1_ckpt:
+        auto = f"results/exp1_{args.dataset}_fixes_v3/exp1_best.pt"
+        if os.path.exists(auto):
+            exp1_ckpt = auto
+            print(f"Auto-detected exp1 checkpoint: {auto}")
+
     if args.mode in ("both", "path_dep"):
-        trainer_pd, log_pd = run_subexp(surface, path_dep=True,
-                                         tag="path_dep", results_dir=RESULTS_DIR)
+        trainer_pd, log_pd = run_subexp(
+            surface, path_dep=True, tag="path_dep",
+            results_dir=RESULTS_DIR, exp1_ckpt_path=exp1_ckpt,
+        )
         log_dfs["path_dep"]  = log_pd
         trainers["path_dep"] = trainer_pd
 
     if args.mode in ("both", "non_path_dep"):
-        trainer_npd, log_npd = run_subexp(surface, path_dep=False,
-                                           tag="non_path_dep", results_dir=RESULTS_DIR)
+        trainer_npd, log_npd = run_subexp(
+            surface, path_dep=False, tag="non_path_dep",
+            results_dir=RESULTS_DIR, exp1_ckpt_path=exp1_ckpt,
+        )
         log_dfs["non_path_dep"]  = log_npd
         trainers["non_path_dep"] = trainer_npd
 
