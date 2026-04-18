@@ -1,0 +1,13 @@
+# Ensure binary files are never subject to line-ending conversion
+*.png  binary
+*.pt   binary
+*.pdf  binary
+*.jpg  binary
+*.jpeg binary
+
+# Python and text files: normalise to LF in repo
+*.py   text eol=lf
+*.csv  text eol=lf
+*.txt  text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
